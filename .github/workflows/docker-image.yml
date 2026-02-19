@@ -3,40 +3,60 @@ name: Build and Push Docker Image to GHCR
 on:
   push:
     branches: ["main"]
-    tags: ["v*.*.*", "v*"]   # e.g., v1.0.0
+    tags: ["v*.*.*", "v*"]
   pull_request:
     branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
-    # Required for pushing to GHCR with GITHUB_TOKEN
+    # Required to push to GHCR with GITHUB_TOKEN
     permissions:
       contents: read
       packages: write
+      # id-token: write # enable later if you add keyless signing
+
+    env:
+      JAVA_VERSION: "17"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Temurin JDK 17
+      - name: Set lowercase owner (for GHCR image path)
+        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+
+      - name: Set up Temurin JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-          cache: "maven"
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
 
-      - name: Build Spring Boot JAR
-        run: mvn -B clean package -DskipTests
+      # Build & test (production: do NOT skip tests)
+      - name: Build & test with Maven
+        run: mvn -B -ntp clean verify
 
-      # Ensure the JAR name expected by your Dockerfile exists
-      - name: Normalize JAR name for Dockerfile
+      # Detect the built JAR (ignore original/sources/javadoc/plain artifacts)
+      - name: Detect JAR path
+        id: jar
+        shell: bash
         run: |
-          JAR_PATH=$(ls -1 target/*.jar | grep -Ev 'original|sources|javadoc' | head -n 1)
-          echo "Detected JAR: $JAR_PATH"
-          cp "$JAR_PATH" target/springbootApp.jar
-          ls -lh target
+          set -euo pipefail
+          JAR=$(ls -1 target/*.jar 2>/dev/null | grep -Ev 'original|sources|javadoc|plain' | head -n 1 || true)
+          if [ -z "${JAR:-}" ]; then
+            echo "No JAR found in target/. Did the build succeed?"
+            ls -la target || true
+            exit 1
+          fi
+          echo "Detected JAR: $JAR"
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -46,16 +66,15 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ env.OWNER_LC }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Generate tags/labels for GHCR
-      - name: Extract Docker metadata
+      # Generate robust tags and standard OCI labels
+      - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # Image path on GHCR. Repo owner must be lowercase for GHCR.
-          images: ghcr.io/${{ github.repository_owner }}/springboot-app
+          images: ghcr.io/${{ env.OWNER_LC }}/springboot-app
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
@@ -69,7 +88,24 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          # Pass the exact jar file into your Dockerfile as a build-arg
+          build-args: |
+            JAR_FILE=${{ steps.jar.outputs.jar }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # platforms: linux/amd64,linux/arm64  # enable if you switch to a multi-arch base image
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          # platforms: linux/amd64
+          # (Enable arm64 once you switch to a multi-arch base image)
+      
+      # Helpful for PR validation/debugging
+      - name: Upload built JAR (PRs only)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: springboot-jar
+          path: ${{ steps.jar.outputs.jar }}
+          if-no-files-found: error
