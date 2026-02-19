@@ -28,7 +28,7 @@ jobs:
           cache: "maven"
 
       - name: Build Spring Boot JAR
-        run: ./mvnw -B clean package -DskipTests
+        run: mvn -B clean package -DskipTests
 
       # Ensure the JAR name expected by your Dockerfile exists
       - name: Normalize JAR name for Dockerfile
