@@ -1,8 +1,75 @@
-name: Docker Image CI
+name: Build and Push Docker Image to GHCR
 
 on:
   push:
     branches: ["main"]
+    tags: ["v*.*.*", "v*"]   # e.g., v1.0.0
+  pull_request:
+    branches: ["main"]
+
 jobs:
-  build:
+  docker:
     runs-on: ubuntu-latest
+
+    # Required for pushing to GHCR with GITHUB_TOKEN
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: "maven"
+
+      - name: Build Spring Boot JAR
+        run: ./mvnw -B clean package -DskipTests
+
+      # Ensure the JAR name expected by your Dockerfile exists
+      - name: Normalize JAR name for Dockerfile
+        run: |
+          JAR_PATH=$(ls -1 target/*.jar | grep -Ev 'original|sources|javadoc' | head -n 1)
+          echo "Detected JAR: $JAR_PATH"
+          cp "$JAR_PATH" target/springbootApp.jar
+          ls -lh target
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generate tags/labels for GHCR
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Image path on GHCR. Repo owner must be lowercase for GHCR.
+          images: ghcr.io/${{ github.repository_owner }}/springboot-app
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+          flavor: |
+            latest=auto
+
+      - name: Build and (optionally) push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # platforms: linux/amd64,linux/arm64  # enable if you switch to a multi-arch base image
